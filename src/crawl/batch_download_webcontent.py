@@ -1,11 +1,22 @@
+import random
 import subprocess
 import time
 import os
 import argparse
+from collections import defaultdict
+
+known_errors = {
+    "connection reset",
+    "connection refused",
+    "timed out",
+    "error 403",
+    "error 429"
+}
+error_counts = defaultdict(int)
 
 # Default wait time of 4s corresponds to ~15 req/min
-# Starts conservative to prevent detection by site
 wait_time = 4
+fail_fast_threshold = 3
 
 # CLI argument setup
 parser = argparse.ArgumentParser(description="Robust wget downloader with retries and auto-resume support.")
@@ -22,6 +33,8 @@ temp_urls = os.path.join(base_output_dir, "retry_urls.txt")
 final_failures_log = os.path.join(base_output_dir, "failed_final.txt")
 
 # === Determine next available log file ===
+os.makedirs(base_output_dir, exist_ok=True)
+os.makedirs(html_output_dir, exist_ok=True)
 existing_logs = [f for f in os.listdir(base_output_dir) if f.startswith("log-attempt") and f.endswith(".txt")]
 attempt_nums = [int(f.split("log-attempt")[1].split(".txt")[0]) for f in existing_logs if f.split("log-attempt")[1].split(".txt")[0].isdigit()]
 next_log_num = max(attempt_nums) + 1 if attempt_nums else 1
@@ -36,6 +49,18 @@ base_cmd = [
     "--limit-rate=100k",
     "--no-clobber",
 ]
+
+def download_single_url(url, wait_time):
+    cmd = base_cmd + [f"--wait={wait_time}", "-P", html_output_dir, url]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output = []
+    for line in process.stdout:
+        print(line, end="")
+        log_file.write(line)
+        output.append(line)
+    process.wait()
+    log_file.flush()
+    return "\n".join(output)
 
 def download_urls(wait_time, url_file):
     cmd = base_cmd + [f"--wait={wait_time}", "-i", url_file, "-P", html_output_dir]
@@ -55,22 +80,50 @@ def download_urls(wait_time, url_file):
     class Result:
         def __init__(self, text):
             self.stdout = text
-            self.stderr = ""  # We merged stderr into stdout
+            self.stderr = ""  # Merged stderr into stdout
 
     return Result("".join(output_lines))
 
 def extract_failed_urls(log_text):
     failed_urls = []
     for line in log_text.splitlines():
-        if ("error 429" in line.lower() or "timed out" in line.lower()) and "url:" in line.lower():
-            parts = line.split("URL:")
-            if len(parts) > 1:
-                failed_url = parts[1].strip()
-                failed_urls.append(failed_url)
+        lower_line = line.lower()
+        if "url:" in lower_line:
+            for err in known_errors:
+                if err in lower_line:
+                    error_counts[err] += 1
+                    parts = line.split("URL:")
+                    if len(parts) > 1:
+                        failed_url = parts[1].strip()
+                        failed_urls.append(failed_url)
+                    break  # avoid double-counting
     return list(set(failed_urls))
 
-# === Setup output structure ===
-os.makedirs(html_output_dir, exist_ok=True)
+def run_fail_fast_first_attempt(urls, wait_time, attempt):
+    print("🧪 Running fail-fast first attempt (one-by-one)")
+    failed = []
+    consecutive_failures = 0
+    for i, url in enumerate(urls):
+        log_file.write(f"\n===== Attempt {attempt} - URL {i+1}: {url} =====\n")
+        result_output = download_single_url(url, wait_time)
+
+        if any(err in result_output.lower() for err in known_errors):
+            error_counts["fail-fast-triggered"] += 1
+            failed.append(url)
+            consecutive_failures += 1
+            if consecutive_failures >= fail_fast_threshold:
+                print(f"\n🚨 Fail-fast triggered: First {fail_fast_threshold} consecutive URLs failed.")
+                log_file.write(f"\n🚨 Fail-fast triggered after {fail_fast_threshold} consecutive failures.\n")
+                log_file.close()
+                exit(1)
+        else:
+            consecutive_failures = 0  # reset on success
+
+        jitter = random.uniform(0.5 * wait_time, 1.5 * wait_time)
+        time.sleep(wait_time + jitter)  # Wait between individual wget calls
+
+    return failed
+
 
 # Determine starting URL file (fresh or resume)
 url_file = final_failures_log if os.path.exists(final_failures_log) else args.input_file
@@ -78,13 +131,19 @@ print(f"📁 Starting URL file: {url_file}")
 final_failures = []
 
 for attempt in range(1, 2 + args.retries):
-    result = download_urls(wait_time, url_file)
-    log_file.write(f"\n===== Attempt {attempt} (wait={wait_time}s) =====\n")
-    log_file.write("STDOUT:\n" + result.stdout + "\n")
-    log_file.write("STDERR:\n" + result.stderr + "\n")
-    log_file.flush()  # Optional: write to disk immediately
+    failed = []
 
-    failed = extract_failed_urls(result.stderr + result.stdout)
+    if attempt == 1:
+        with open(url_file, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        failed = run_fail_fast_first_attempt(urls, wait_time, attempt)
+    else:
+        result = download_urls(wait_time, url_file)
+        log_file.write(f"\n===== Attempt {attempt} (wait={wait_time}s) =====\n")
+        log_file.write("STDOUT:\n" + result.stdout + "\n")
+        log_file.write("STDERR:\n" + result.stderr + "\n")
+        log_file.flush()
+        failed = extract_failed_urls(result.stdout)
 
     if not failed:
         print("✅ All downloads completed successfully.")
@@ -110,7 +169,13 @@ else:
             f.write(url + "\n")
     print(f"📝 {len(final_failures)} URLs logged in {final_failures_log} for later resumption.")
 
-# Cleanup
+if error_counts:
+    print("\n📊 Error summary:")
+    log_file.write("\n📊 Error summary:\n")
+    for err, count in error_counts.items():
+        print(f"  {err}: {count}")
+        log_file.write(f"  {err}: {count}\n")
+
 if os.path.exists(temp_urls):
     os.remove(temp_urls)
 
