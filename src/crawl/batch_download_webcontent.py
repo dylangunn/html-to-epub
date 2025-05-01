@@ -5,6 +5,10 @@ import os
 import argparse
 from collections import defaultdict
 
+# TODO: [Medium] Add a referer header to wget calls
+# TODO: [Low] Add a prompt to inject cookies if required
+# TODO: [Medium] Expand known error codes
+
 known_errors = {
     "connection reset",
     "connection refused",
@@ -17,6 +21,15 @@ error_counts = defaultdict(int)
 # Default wait time of 4s corresponds to ~15 req/min
 wait_time = 4
 fail_fast_threshold = 3
+
+# Wget base command
+base_cmd = [
+    "wget",
+    "--random-wait",
+    "--limit-rate=100k",
+    "--no-clobber",
+    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+]
 
 # CLI argument setup
 parser = argparse.ArgumentParser(description="Robust wget downloader with retries and auto-resume support.")
@@ -41,14 +54,6 @@ next_log_num = max(attempt_nums) + 1 if attempt_nums else 1
 log_file_path = os.path.join(base_output_dir, f"log-attempt{next_log_num}.txt")
 log_file = open(log_file_path, "w", encoding="utf-8")
 print(f"📄 Logging to {log_file_path}")
-
-# Wget base command
-base_cmd = [
-    "wget",
-    "--random-wait",
-    "--limit-rate=100k",
-    "--no-clobber",
-]
 
 def download_single_url(url, wait_time):
     cmd = base_cmd + [f"--wait={wait_time}", "-P", html_output_dir, url]
