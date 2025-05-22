@@ -3,6 +3,8 @@ import subprocess
 import time
 import os
 import argparse
+import requests
+from bs4 import BeautifulSoup
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -20,39 +22,68 @@ known_errors = {
 }
 error_counts = defaultdict(int)
 
-wait_time = 3   # 3s is ~20 req/min
-fail_fast_threshold = 3
+FAIL_FAST_THRESHOLD = 3
 
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 base_cmd = [
     "wget",
     "--random-wait",
     "--limit-rate=100k",
+    "--no-parent",
+    "--no-directories",
     "--no-clobber",
-    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    "--content-disposition",
+    "--trust-server-names",
+    "--user-agent=" + user_agent
 ]
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Robust wget downloader with retries and auto-resume support.")
-    parser.add_argument("input_file", help="Path to the file containing list of URLs")
     parser.add_argument("project_name", help="Name for output subfolder inside ./projects/")
     parser.add_argument("--retries", type=int, default=2, help="Number of retries for failed downloads (default: 2)")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--index_file", help="Path to the file containing page content of the index page containing a list of chapter links")
+    group.add_argument("--input_file", help="Path to the file containing list of URLs")
+
     return parser.parse_args()
 
 def get_project_paths(project_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     base_output_dir = os.path.join(script_dir, "..", "..", "projects", project_name)
     html_output_dir = os.path.join(base_output_dir, "html_output")
-    temp_urls = os.path.join(base_output_dir, "retry_urls.txt")
+    temp_urls = os.path.join(base_output_dir, "temp_urls.txt")
+    retry_urls = os.path.join(base_output_dir, "retry_urls.txt")
     final_failures_log = os.path.join(base_output_dir, "failed_final.txt")
 
     return SimpleNamespace(
         base_output_dir=base_output_dir,
         html_output_dir=html_output_dir,
         temp_urls=temp_urls,
+        retry_urls=retry_urls,
         final_failures_log=final_failures_log
     )
 
-def download_single_url(url, wait_time):
+def get_urls_from_index_file(index_html, paths):
+    with open(index_html, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a['href']
+        if 'chapter' in href: # TODO: Update logic
+            links.add(href)
+    print("found links")
+    print(links)
+
+    with open(paths.temp_urls, "w") as f:
+        for link in sorted(links):
+            f.write(link + "\n")
+    
+    return
+
+def download_single_url(url, wait_time, html_output_dir, log_file):
     cmd = base_cmd + [f"--wait={wait_time}", "-P", html_output_dir, url]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     output = []
@@ -64,7 +95,7 @@ def download_single_url(url, wait_time):
     log_file.flush()
     return "\n".join(output)
 
-def download_urls(wait_time, url_file):
+def download_urls(wait_time, url_file, html_output_dir, log_file):
     cmd = base_cmd + [f"--wait={wait_time}", "-i", url_file, "-P", html_output_dir]
     print(f"\n⏳ Running wget with wait={wait_time}s ...")
 
@@ -101,13 +132,13 @@ def extract_failed_urls(log_text):
                     break  # avoid double-counting
     return list(set(failed_urls))
 
-def run_fail_fast_first_attempt(urls, wait_time, attempt):
+def run_fail_fast_first_attempt(urls, wait_time, log_file, html_output_dir, attempt):
     print("🧪 Running fail-fast first attempt (one-by-one)")
     failed_urls = []
     consecutive_failures = 0
     for i, url in enumerate(urls):
         log_file.write(f"\n===== Attempt {attempt} - URL {i+1}: {url} =====\n")
-        result_output = download_single_url(url, wait_time)
+        result_output = download_single_url(url, wait_time, html_output_dir, log_file)
 
         if any(err in result_output.lower() for err in known_errors):
             error_counts["fail-fast-triggered"] += 1
@@ -130,6 +161,7 @@ def run_fail_fast_first_attempt(urls, wait_time, attempt):
 def download_webcontent():
     args = parse_arguments()
     paths = get_project_paths(args.project_name)
+    wait_time = 3
 
     # === Determine next available log file ===
     os.makedirs(paths.base_output_dir, exist_ok=True)
@@ -141,20 +173,25 @@ def download_webcontent():
     log_file = open(log_file_path, "w", encoding="utf-8")
     print(f"📄 Logging to {log_file_path}")
 
-    # Determine starting URL file (fresh or resume)
-    url_file = paths.final_failures_log if os.path.exists(paths.final_failures_log) else args.input_file
+    if args.index_file:
+        print("Reading from index file")
+        get_urls_from_index_file(args.index_file, paths)
+        url_file = paths.temp_urls
+    else: 
+        print("Reading from input file or previous failures file")
+        url_file = paths.final_failures_log if os.path.exists(paths.final_failures_log) else args.input_file
     print(f"📁 Starting URL file: {url_file}")
-    final_failures = []
 
     # Run fail-fast pre-check
     with open(url_file, "r", encoding="utf-8") as f:
         urls = [line.strip() for line in f if line.strip()]
 
-    fail_fast_urls = urls[:fail_fast_threshold]
-    _ = run_fail_fast_first_attempt(fail_fast_urls, wait_time, attempt=0)  # 0 = preflight
+    fail_fast_urls = urls[:FAIL_FAST_THRESHOLD]
+    _ = run_fail_fast_first_attempt(fail_fast_urls, wait_time, log_file, paths.html_output_dir, attempt=0)  # 0 = preflight
 
+    final_failures = []
     for attempt in range(1, 2 + args.retries):
-        result = download_urls(wait_time, url_file)
+        result = download_urls(wait_time, url_file, paths.html_output_dir, log_file)
         log_file.write(f"\n===== Attempt {attempt} (wait={wait_time}s) =====\n")
         log_file.write("STDOUT:\n" + result.stdout + "\n")
         log_file.write("STDERR:\n" + result.stderr + "\n")
@@ -170,12 +207,12 @@ def download_webcontent():
 
         print(f"⚠️ Attempt {attempt}: {len(failed_urls)} URLs failed. Retrying with wait={wait_time + 2}s...")
 
-        with open(paths.temp_urls, "w") as f:
+        with open(paths.retry_urls, "w") as f:
             for url in failed_urls:
                 f.write(url + "\n")
 
         final_failures = failed_urls
-        url_file = paths.temp_urls
+        url_file = paths.retry_urls
         wait_time += 2
         time.sleep(wait_time)
 
@@ -193,8 +230,8 @@ def download_webcontent():
             print(f"  {err}: {count}")
             log_file.write(f"  {err}: {count}\n")
 
-    if os.path.exists(paths.temp_urls):
-        os.remove(paths.temp_urls)
+    if os.path.exists(paths.retry_urls):
+        os.remove(paths.retry_urls)
 
     log_file.close()
 
