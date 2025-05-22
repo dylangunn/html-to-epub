@@ -17,11 +17,13 @@ def get_project_paths(project_name):
     base_output_dir = os.path.join(script_dir, "..", "..", "projects", project_name)
     xhtml_dir = os.path.join(base_output_dir, "xhtml_output")
     output_epub = os.path.join(base_output_dir, project_name + ".epub")
+    css_file = os.path.join(script_dir, "styles.css")
 
     return SimpleNamespace(
         base_output_dir=base_output_dir,
         xhtml_dir=xhtml_dir,
-        output_epub=output_epub
+        output_epub=output_epub,
+        css_file=css_file
     )
 
 def generate_epub(args, paths):
@@ -46,7 +48,14 @@ def generate_epub(args, paths):
         print("❌ No XHTML files found to convert.")
         return
 
-    command = ["pandoc", *xhtml_files, "-o", paths.output_epub, "--toc", "--metadata", f"title={args.project_name}"]
+    command = [
+        "pandoc",
+        *xhtml_files,
+        "-o", paths.output_epub,
+        "--toc",
+        "--css", paths.css_file,
+        "--metadata", f"title={args.project_name}"
+    ]
 
     try:
         subprocess.run(command, check=True)
