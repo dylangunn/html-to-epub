@@ -1,4 +1,6 @@
 import argparse
+import os
+from types import SimpleNamespace
 from crawl.batch_download_webcontent import download_webcontent
 from clean.clean_project_html import extract_chapters
 
