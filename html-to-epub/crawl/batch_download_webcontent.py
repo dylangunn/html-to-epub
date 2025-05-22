@@ -37,7 +37,7 @@ base_cmd = [
     "--user-agent=" + user_agent
 ]
 
-def parse_arguments():
+def parse_args():
     parser = argparse.ArgumentParser(description="Robust wget downloader with retries and auto-resume support.")
     parser.add_argument("project_name", help="Name for output subfolder inside ./projects/")
     parser.add_argument("--retries", type=int, default=2, help="Number of retries for failed downloads (default: 2)")
@@ -51,13 +51,19 @@ def get_project_paths(project_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     base_output_dir = os.path.join(script_dir, "..", "..", "projects", project_name)
     html_output_dir = os.path.join(base_output_dir, "html_output")
+    log_output_dir = os.path.join(base_output_dir, "logs")
     temp_urls = os.path.join(base_output_dir, "temp_urls.txt")
     retry_urls = os.path.join(base_output_dir, "retry_urls.txt")
     final_failures_log = os.path.join(base_output_dir, "failed_final.txt")
 
+    os.makedirs(base_output_dir, exist_ok=True)
+    os.makedirs(html_output_dir, exist_ok=True)
+    os.makedirs(log_output_dir, exist_ok=True)
+
     return SimpleNamespace(
         base_output_dir=base_output_dir,
         html_output_dir=html_output_dir,
+        log_output_dir=log_output_dir,
         temp_urls=temp_urls,
         retry_urls=retry_urls,
         final_failures_log=final_failures_log
@@ -144,9 +150,9 @@ def run_fail_fast_first_attempt(urls, wait_time, log_file, html_output_dir, atte
             error_counts["fail-fast-triggered"] += 1
             failed_urls.append(url)
             consecutive_failures += 1
-            if consecutive_failures >= fail_fast_threshold:
-                print(f"\n🚨 Fail-fast triggered: First {fail_fast_threshold} consecutive URLs failed.")
-                log_file.write(f"\n🚨 Fail-fast triggered after {fail_fast_threshold} consecutive failures.\n")
+            if consecutive_failures >= FAIL_FAST_THRESHOLD:
+                print(f"\n🚨 Fail-fast triggered: First {FAIL_FAST_THRESHOLD} consecutive URLs failed.")
+                log_file.write(f"\n🚨 Fail-fast triggered after {FAIL_FAST_THRESHOLD} consecutive failures.\n")
                 log_file.close()
                 exit(1)
         else:
@@ -158,18 +164,18 @@ def run_fail_fast_first_attempt(urls, wait_time, log_file, html_output_dir, atte
     return failed_urls
 
 
-def download_webcontent():
-    args = parse_arguments()
-    paths = get_project_paths(args.project_name)
+def download_webcontent(args, paths):
+    if not args:
+        args = parse_args()
+    if not paths:
+        paths = get_project_paths(args.project_name)
     wait_time = 3
 
     # === Determine next available log file ===
-    os.makedirs(paths.base_output_dir, exist_ok=True)
-    os.makedirs(paths.html_output_dir, exist_ok=True)
     existing_logs = [f for f in os.listdir(paths.base_output_dir) if f.startswith("log-attempt") and f.endswith(".txt")]
     attempt_nums = [int(f.split("log-attempt")[1].split(".txt")[0]) for f in existing_logs if f.split("log-attempt")[1].split(".txt")[0].isdigit()]
     next_log_num = max(attempt_nums) + 1 if attempt_nums else 1
-    log_file_path = os.path.join(paths.base_output_dir, f"log-attempt{next_log_num}.txt")
+    log_file_path = os.path.join(paths.log_output_dir, f"log-attempt{next_log_num}.txt")
     log_file = open(log_file_path, "w", encoding="utf-8")
     print(f"📄 Logging to {log_file_path}")
 
@@ -187,7 +193,7 @@ def download_webcontent():
         urls = [line.strip() for line in f if line.strip()]
 
     fail_fast_urls = urls[:FAIL_FAST_THRESHOLD]
-    _ = run_fail_fast_first_attempt(fail_fast_urls, wait_time, log_file, paths.html_output_dir, attempt=0)  # 0 = preflight
+    _ = run_fail_fast_first_attempt(fail_fast_urls, wait_time, log_file, paths.html_output_dir, attempt=0)
 
     final_failures = []
     for attempt in range(1, 2 + args.retries):
@@ -236,4 +242,4 @@ def download_webcontent():
     log_file.close()
 
 if __name__ == "__main__":
-    download_webcontent()
+    download_webcontent(None, None)
