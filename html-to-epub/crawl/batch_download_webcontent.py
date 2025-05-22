@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from collections import defaultdict
 from types import SimpleNamespace
+from get_urls import get_urls_from_index_file
 
 # TODO: [Medium] Add a referer header to wget calls
 # TODO: [Low] Add a prompt to inject cookies if required
@@ -23,18 +24,15 @@ known_errors = {
 error_counts = defaultdict(int)
 
 FAIL_FAST_THRESHOLD = 3
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
-user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 base_cmd = [
     "wget",
-    "--random-wait",
     "--limit-rate=100k",
     "--no-parent",
     "--no-directories",
     "--no-clobber",
-    "--content-disposition",
-    "--trust-server-names",
-    "--user-agent=" + user_agent
+    "--user-agent=" + USER_AGENT
 ]
 
 def parse_args():
@@ -49,9 +47,15 @@ def parse_args():
 
 def get_project_paths(project_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_output_dir = os.path.join(script_dir, "..", "..", "projects", project_name)
+    base_output_dir = os.path.abspath(os.path.join(script_dir, "..", "..", "projects", project_name))
     html_output_dir = os.path.join(base_output_dir, "html_output")
+
     log_output_dir = os.path.join(base_output_dir, "logs")
+    existing_logs = [f for f in os.listdir(log_output_dir) if f.startswith("log-attempt") and f.endswith(".txt")]
+    attempt_nums = [int(f.split("log-attempt")[1].split(".txt")[0]) for f in existing_logs if f.split("log-attempt")[1].split(".txt")[0].isdigit()]
+    next_log_num = max(attempt_nums) + 1 if attempt_nums else 1
+    log_file = os.path.join(log_output_dir, f"log-attempt{next_log_num}.txt")
+
     temp_urls = os.path.join(base_output_dir, "temp_urls.txt")
     retry_urls = os.path.join(base_output_dir, "retry_urls.txt")
     final_failures_log = os.path.join(base_output_dir, "failed_final.txt")
@@ -63,35 +67,25 @@ def get_project_paths(project_name):
     return SimpleNamespace(
         base_output_dir=base_output_dir,
         html_output_dir=html_output_dir,
-        log_output_dir=log_output_dir,
+        log_file=log_file,
         temp_urls=temp_urls,
         retry_urls=retry_urls,
         final_failures_log=final_failures_log
     )
 
-def get_urls_from_index_file(index_html, paths):
-    with open(index_html, "r", encoding="utf-8") as f:
-        html = f.read()
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    links = set()
-    for a in soup.find_all("a", href=True):
-        href = a['href']
-        if 'chapter' in href: # TODO: Update logic
-            links.add(href)
-    print("found links")
-    print(links)
-
-    with open(paths.temp_urls, "w") as f:
-        for link in sorted(links):
-            f.write(link + "\n")
-    
-    return
-
 def download_single_url(url, wait_time, html_output_dir, log_file):
-    cmd = base_cmd + [f"--wait={wait_time}", "-P", html_output_dir, url]
+    filename = url.rstrip("/").split("/")[-1] + ".html"
+    output_path = os.path.join(html_output_dir, filename)
+
+    if os.path.exists(output_path):
+        print(f"⚠️ Skipping (already exists): {filename}")
+        return ""
+    
+    cmd = base_cmd + [f"-O", output_path, url]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    jitter = random.uniform(0.5 * wait_time, 1.5 * wait_time)
+    time.sleep(wait_time + jitter)
+    
     output = []
     for line in process.stdout:
         print(line, end="")
@@ -101,27 +95,46 @@ def download_single_url(url, wait_time, html_output_dir, log_file):
     log_file.flush()
     return "\n".join(output)
 
+def run_fail_fast(urls, wait_time, log_file, html_output_dir):
+    print("🧪 Running fail-fast")
+    failed_urls = []
+    consecutive_failures = 0
+    for i, url in enumerate(urls):
+        log_file.write(f"\n===== Attempt 0 - URL {i+1}: {url} =====\n")
+        result_output = download_single_url(url, wait_time, html_output_dir, log_file)
+
+        if any(err in result_output.lower() for err in known_errors):
+            error_counts["fail-fast-triggered"] += 1
+            failed_urls.append(url)
+            consecutive_failures += 1
+            if consecutive_failures >= FAIL_FAST_THRESHOLD:
+                print(f"\n🚨 Fail-fast triggered: First {FAIL_FAST_THRESHOLD} consecutive URLs failed.")
+                log_file.write(f"\n🚨 Fail-fast triggered after {FAIL_FAST_THRESHOLD} consecutive failures.\n")
+                log_file.close()
+                exit(1)
+        else:
+            consecutive_failures = 0  # reset on success
+
+    return
+
 def download_urls(wait_time, url_file, html_output_dir, log_file):
-    cmd = base_cmd + [f"--wait={wait_time}", "-i", url_file, "-P", html_output_dir]
-    print(f"\n⏳ Running wget with wait={wait_time}s ...")
+    with open(url_file, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f if line.strip()]
+    fail_fast_urls = urls[:5]
+    urls = urls[5:]
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    run_fail_fast(fail_fast_urls, wait_time, log_file, html_output_dir)
+    
+    output = []
+    for i, url in enumerate(urls):
+        output.extend(download_single_url(url, wait_time, html_output_dir, log_file))
 
-    output_lines = []
-    for line in process.stdout:
-        print(line, end="")        # Live terminal output
-        log_file.write(line)       # Write to log
-        output_lines.append(line)  # Store for error parsing
-    process.wait()
-    log_file.flush()
-
-    # Return collected output as a mock `CompletedProcess`-like object
     class Result:
         def __init__(self, text):
             self.stdout = text
-            self.stderr = ""  # Merged stderr into stdout
+            self.stderr = ""
 
-    return Result("".join(output_lines))
+    return Result("\n".join(output))
 
 def extract_failed_urls(log_text):
     failed_urls = []
@@ -138,32 +151,6 @@ def extract_failed_urls(log_text):
                     break  # avoid double-counting
     return list(set(failed_urls))
 
-def run_fail_fast_first_attempt(urls, wait_time, log_file, html_output_dir, attempt):
-    print("🧪 Running fail-fast first attempt (one-by-one)")
-    failed_urls = []
-    consecutive_failures = 0
-    for i, url in enumerate(urls):
-        log_file.write(f"\n===== Attempt {attempt} - URL {i+1}: {url} =====\n")
-        result_output = download_single_url(url, wait_time, html_output_dir, log_file)
-
-        if any(err in result_output.lower() for err in known_errors):
-            error_counts["fail-fast-triggered"] += 1
-            failed_urls.append(url)
-            consecutive_failures += 1
-            if consecutive_failures >= FAIL_FAST_THRESHOLD:
-                print(f"\n🚨 Fail-fast triggered: First {FAIL_FAST_THRESHOLD} consecutive URLs failed.")
-                log_file.write(f"\n🚨 Fail-fast triggered after {FAIL_FAST_THRESHOLD} consecutive failures.\n")
-                log_file.close()
-                exit(1)
-        else:
-            consecutive_failures = 0  # reset on success
-
-        jitter = random.uniform(0.5 * wait_time, 1.5 * wait_time)
-        time.sleep(wait_time + jitter)  # Wait between individual wget calls
-
-    return failed_urls
-
-
 def download_webcontent(args, paths):
     if not args:
         args = parse_args()
@@ -171,36 +158,23 @@ def download_webcontent(args, paths):
         paths = get_project_paths(args.project_name)
     wait_time = 3
 
-    # === Determine next available log file ===
-    existing_logs = [f for f in os.listdir(paths.base_output_dir) if f.startswith("log-attempt") and f.endswith(".txt")]
-    attempt_nums = [int(f.split("log-attempt")[1].split(".txt")[0]) for f in existing_logs if f.split("log-attempt")[1].split(".txt")[0].isdigit()]
-    next_log_num = max(attempt_nums) + 1 if attempt_nums else 1
-    log_file_path = os.path.join(paths.log_output_dir, f"log-attempt{next_log_num}.txt")
-    log_file = open(log_file_path, "w", encoding="utf-8")
-    print(f"📄 Logging to {log_file_path}")
+    log_file = open(paths.log_file, "w", encoding="utf-8")
+    print(f"📄 Logging to {paths.log_file}")
 
     if args.index_file:
         print("Reading from index file")
         get_urls_from_index_file(args.index_file, paths)
         url_file = paths.temp_urls
     else: 
-        print("Reading from input file or previous failures file")
+        print("Reading from pre-created url file or previous url failures file")
         url_file = paths.final_failures_log if os.path.exists(paths.final_failures_log) else args.input_file
     print(f"📁 Starting URL file: {url_file}")
 
-    # Run fail-fast pre-check
-    with open(url_file, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip()]
-
-    fail_fast_urls = urls[:FAIL_FAST_THRESHOLD]
-    _ = run_fail_fast_first_attempt(fail_fast_urls, wait_time, log_file, paths.html_output_dir, attempt=0)
-
     final_failures = []
     for attempt in range(1, 2 + args.retries):
-        result = download_urls(wait_time, url_file, paths.html_output_dir, log_file)
         log_file.write(f"\n===== Attempt {attempt} (wait={wait_time}s) =====\n")
+        result = download_urls(wait_time, url_file, paths.html_output_dir, log_file)
         log_file.write("STDOUT:\n" + result.stdout + "\n")
-        log_file.write("STDERR:\n" + result.stderr + "\n")
         log_file.flush()
 
         failed_urls = extract_failed_urls(result.stdout)
